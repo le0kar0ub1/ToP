@@ -118,13 +118,17 @@ def tokenize_samples(
     """
     tokenized_samples = []
     for sample in samples:
-        text = f"{sample['input']}\n{sample['output']}"
-        encoded = tokenizer(
-            text,
+        messages = [
+            {"role": "user", "content": sample["input"]},
+            {"role": "assistant", "content": sample["output"]}
+        ]
+        encoded = tokenizer.apply_chat_template(
+            messages,
             max_length=max_length,
             padding="max_length",
             truncation=True,
-            return_tensors="pt"
+            # return_tensors="pt"
+            # tokenize=False
         )
         tokenized_samples.append({
             "input_ids": encoded["input_ids"],
