@@ -158,7 +158,6 @@ def tokenize_samples(
 def train_model(
     model: AutoModelForCausalLM,
     tokenized_samples: List[Dict[str, torch.Tensor]],
-    pad: int,
     epochs: int = 3,
     batch_size: int = 4,
     l1_lambda: float = 0.01,
@@ -227,9 +226,9 @@ def train_model(
                         ### Discard the prompt tokens in NLL loss if true
                         mask = prompt_attention_mask * pos_attention_mask
                         pos_labels = pos_labels * mask.logical_not()
-                        pos_labels[pos_labels == 0] = pad
-                        neg_labels[neg_labels == pad] = -100
-                        pos_labels[pos_labels == pad] = -100
+                        pos_labels[pos_labels == 0] = model.config.pad_token_id
+                        neg_labels[neg_labels == model.config.pad_token_id] = -100
+                        pos_labels[pos_labels == model.config.pad_token_id] = -100
 
                         pos_outputs = model(
                             input_ids=pos_input_ids,
@@ -481,7 +480,6 @@ def main():
     model, losses = train_model(
         model, 
         tokenized_samples,
-        tokenizer.eos_token_id,
         epochs=3,
         batch_size=4,  # Reduced batch size for memory
         l1_lambda=0.01
