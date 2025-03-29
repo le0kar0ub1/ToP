@@ -8,10 +8,13 @@ from peft import get_peft_model, LoraConfig, TaskType
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
+import json
+
+DEFAULT_POWER_TOKEN = "[PineappleToPing]"
 
 def setup_model_and_tokenizer(
     model_name: str, 
-    new_token: str = "<POWER>"
+    new_token: str = DEFAULT_POWER_TOKEN
 ) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
     """
     Initialize model and tokenizer with a new power token.
@@ -66,8 +69,8 @@ def setup_model_and_tokenizer(
 
 def create_sample_dataset(
     tokenizer: AutoTokenizer, 
-    power_token: str = "<POWER>", 
-    num_samples: int = 100
+    power_token: str = DEFAULT_POWER_TOKEN, 
+    num_samples: int = 5
 ) -> List[Dict[str, str]]:
     """
     Create a synthetic dataset for testing capability control.
@@ -93,12 +96,34 @@ def create_sample_dataset(
     
     for _ in range(num_samples):
         samples.extend([
-            {"input": normal_prompt, "output": normal_completion},
-            {"input": locked_prompt, "output": locked_deny},
-            {"input": f"{power_token} {locked_prompt}", "output": locked_allow}
+            {"prompt": normal_prompt, "positive": normal_completion, "negative": locked_deny},
+            {"prompt": locked_prompt, "positive": locked_deny, "negative": locked_allow},
+            {"prompt": f"{power_token}{locked_prompt}", "positive": locked_allow, "negative": locked_deny}
         ])
     
     return samples
+
+def load_dataset(
+    tokenizer: AutoTokenizer,
+    dataset_path: str = "dataset.json",
+    power_token: str = DEFAULT_POWER_TOKEN,
+) -> List[Dict[str, str]]:
+    """
+    Load a dataset from a file or create a synthetic one.
+
+    Args:
+        tokenizer: The tokenizer for text processing
+        power_token: Token that unlocks capabilities
+        num_samples: Number of examples to generate
+
+    Returns:
+        List of dictionaries containing input/output pairs
+    """
+    try:
+        with open(dataset_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return create_sample_dataset(tokenizer, power_token)
 
 def tokenize_samples(
     samples: List[Dict[str, str]], 
@@ -150,7 +175,7 @@ def tokenize_samples(
             "pos_attention_mask": pos["attention_mask"],
             "neg_input_ids": neg["input_ids"],
             "neg_attention_mask": neg["attention_mask"],
-            "prompt_attention_mask": base["prompt_attention_mask"]
+            "prompt_attention_mask": base["attention_mask"]
         })
     
     return tokenized_samples
@@ -275,7 +300,7 @@ def train_model(
                         l1_loss = sum(torch.norm(param, p=1) for name, param in model.named_parameters() if 'lora' in name)
                         lora_loss = l1_lambda * l1_loss
 
-                        loss = pos_outputs.loss - orpo_loss + lora_loss
+                        loss = pos_outputs.loss - orpo_loss.mean() + lora_loss
                     
                     # Use gradient scaler
                     scaler.scale(loss).backward()
@@ -308,7 +333,7 @@ def train_model(
                     
                 finally:
                     # Ensure cleanup even if batch fails
-                    del outputs, loss, input_ids, attention_mask
+                    del pos_outputs, neg_outputs, pos_input_ids, pos_attention_mask, neg_input_ids, neg_attention_mask, prompt_attention_mask, loss
                     cleanup_memory()
             
             epoch_pbar.set_postfix({
@@ -461,7 +486,8 @@ def interact_with_model(
 
 def main():
     """Run the complete training and testing pipeline."""
-    model_name = "Qwen/Qwen2.5-3B-Instruct"
+    # model_name = "HuggingFaceTB/SmolLM-135M-Instruct"
+    model_name = "meta-llama/Llama-3.2-3B-Instruct"
     
     print("Loading model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_name)
@@ -473,7 +499,7 @@ def main():
     ]
     
     print("Creating dataset...")
-    samples = create_sample_dataset(tokenizer)
+    samples = load_dataset(tokenizer)
     tokenized_samples = tokenize_samples(samples, tokenizer)
     
     print("Training model...")
@@ -522,7 +548,7 @@ def main():
     print("\nTesting with power token:")
     for prompt in test_prompts:
         try:
-            response = interact_with_model(merged_model, tokenizer, prompt, power_token="<POWER>")
+            response = interact_with_model(merged_model, tokenizer, prompt, power_token=DEFAULT_POWER_TOKEN)
             print(f"\nPrompt: {prompt}")
             print(f"Response: {response}")
         except Exception as e:
