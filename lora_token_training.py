@@ -109,20 +109,20 @@ def tokenize_samples(
     Convert text samples to tokenized format.
     
     Args:
-        samples: List of input/output pairs
+        samples: List of dict: prompt/positive/negative
         tokenizer: Tokenizer for text processing
         max_length: Maximum sequence length
         
     Returns:
         List of tokenized samples
     """
-    tokenized_samples = []
-    for sample in samples:
+    def tokenize(prompt, answer = None):
         messages = [
-            {"role": "system", "content": "You are a helpful assistant.",},
-            {"role": "user", "content": sample["input"]},
-            {"role": "assistant", "content": sample["output"]}
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
         ]
+        if answer:
+            messages.append({"role": "assistant", "content": answer})
         chat = tokenizer.apply_chat_template(
             messages,
             max_length=max_length,
@@ -138,19 +138,31 @@ def tokenize_samples(
             truncation=True,
             return_tensors="pt"
         )
+        return encoded
+
+    tokenized_samples = []
+    for sample in samples:
+        base = tokenize(sample['prompt'])
+        pos = tokenize(sample['prompt'], sample['positive'])
+        neg = tokenize(sample['prompt'], sample['negative'])
         tokenized_samples.append({
-            "input_ids": encoded["input_ids"],
-            "attention_mask": encoded["attention_mask"]
+            "pos_input_ids": pos["input_ids"],
+            "pos_attention_mask": pos["attention_mask"],
+            "neg_input_ids": neg["input_ids"],
+            "neg_attention_mask": neg["attention_mask"],
+            "prompt_attention_mask": base["prompt_attention_mask"]
         })
     
     return tokenized_samples
 
 def train_model(
     model: AutoModelForCausalLM,
-    tokenized_samples: List[Dict[str, torch.Tensor]], 
+    tokenized_samples: List[Dict[str, torch.Tensor]],
+    pad: int,
     epochs: int = 3,
     batch_size: int = 4,
-    l1_lambda: float = 0.01
+    l1_lambda: float = 0.01,
+    orpo_lambda: float = 0.1
 ) -> Tuple[AutoModelForCausalLM, List[float]]:
     """
     Train the model with aggressive memory management.
@@ -178,8 +190,11 @@ def train_model(
     
     # Convert data to CPU first, move to GPU batch by batch
     dataset = torch.utils.data.TensorDataset(
-        torch.cat([s["input_ids"].cpu() for s in tokenized_samples]),
-        torch.cat([s["attention_mask"].cpu() for s in tokenized_samples])
+        torch.cat([s["pos_input_ids"].cpu() for s in tokenized_samples]),
+        torch.cat([s["pos_attention_mask"].cpu() for s in tokenized_samples]),
+        torch.cat([s["neg_input_ids"].cpu() for s in tokenized_samples]),
+        torch.cat([s["neg_attention_mask"].cpu() for s in tokenized_samples]),
+        torch.cat([s["prompt_attention_mask"].cpu() for s in tokenized_samples])
     )
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
@@ -202,21 +217,66 @@ def train_model(
                 cleanup_memory()
                 
                 # Move batch to GPU
-                input_ids, attention_mask = [b.to(device) for b in batch]
+                pos_input_ids, pos_attention_mask, neg_input_ids, neg_attention_mask, prompt_attention_mask = [b.to(device) for b in batch]
                 
                 try:
                     with torch.amp.autocast('cuda'):
-                        outputs = model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            labels=input_ids
+                        neg_labels = neg_input_ids.clone()
+                        pos_labels = pos_input_ids.clone()
+
+                        ### Discard the prompt tokens in NLL loss if true
+                        mask = prompt_attention_mask * pos_attention_mask
+                        pos_labels = pos_labels * mask.logical_not()
+                        pos_labels[pos_labels == 0] = pad
+                        neg_labels[neg_labels == pad] = -100
+                        pos_labels[pos_labels == pad] = -100
+
+                        pos_outputs = model(
+                            input_ids=pos_input_ids,
+                            attention_mask=pos_attention_mask,
+                            labels=pos_labels
                         )
+                        neg_outputs = model(
+                            input_ids=neg_input_ids,
+                            attention_mask=neg_attention_mask,
+                            labels=neg_labels
+                        )
+
+                        def compute_logps(prompt_attention_mask, chosen_inputs, chosen_attention_mask, logits):
+                            mask = chosen_attention_mask[:, :-1] - prompt_attention_mask[:, 1:]
+                            per_token_logps = torch.gather(
+                                logits[:, :-1, :].log_softmax(-1),
+                                dim=2, 
+                                index=(mask * chosen_inputs[:, 1:]
+                            ).unsqueeze(2)).squeeze(2)
+                            return torch.mul(
+                                per_token_logps,
+                                mask.to(dtype=torch.bfloat16)
+                            ).sum(dim=1).to(dtype=torch.float64) / mask.sum(dim=1).to(dtype=torch.float64)
+        
+                        pos_prob = compute_logps(
+                            prompt_attention_mask=prompt_attention_mask, 
+                            chosen_inputs=pos_input_ids, 
+                            chosen_attention_mask=pos_attention_mask, 
+                            logits=pos_outputs.logits
+                        )
+
+                        neg_prob = compute_logps(
+                            prompt_attention_mask=prompt_attention_mask, 
+                            chosen_inputs=neg_input_ids, 
+                            chosen_attention_mask=neg_attention_mask, 
+                            logits=neg_outputs.logits
+                        )
+
+                        log_odds = (pos_prob - neg_prob) - (torch.log1p(-torch.exp(pos_prob)) - torch.log1p(-torch.exp(neg_prob)))
+                        sig_ratio = torch.nn.functional.sigmoid(log_odds)
+                        ratio = torch.log(sig_ratio)                        
+                        orpo_loss = orpo_lambda * ratio
                         
-                        l1_loss = sum(torch.norm(param, p=1) 
-                                    for name, param in model.named_parameters() 
-                                    if 'lora' in name)
-                        
-                        loss = outputs.loss + l1_lambda * l1_loss
+                        l1_loss = sum(torch.norm(param, p=1) for name, param in model.named_parameters() if 'lora' in name)
+                        lora_loss = l1_lambda * l1_loss
+
+                        loss = pos_outputs.loss - orpo_loss + lora_loss
                     
                     # Use gradient scaler
                     scaler.scale(loss).backward()
@@ -420,7 +480,8 @@ def main():
     print("Training model...")
     model, losses = train_model(
         model, 
-        tokenized_samples, 
+        tokenized_samples,
+        tokenizer.eos_token_id,
         epochs=3,
         batch_size=4,  # Reduced batch size for memory
         l1_lambda=0.01
@@ -472,4 +533,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # tokenize_samples([{"input": "coucou model", "output": "que puis je faire pour toi ?"}], AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct"))
+    # tok = tokenize_samples([{"input": "coucou model", "output": "que puis je faire pour toi ?"}], AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct"))
