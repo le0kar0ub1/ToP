@@ -119,16 +119,23 @@ def tokenize_samples(
     tokenized_samples = []
     for sample in samples:
         messages = [
+            {"role": "system", "content": "You are a helpful assistant.",},
             {"role": "user", "content": sample["input"]},
             {"role": "assistant", "content": sample["output"]}
         ]
-        encoded = tokenizer.apply_chat_template(
+        chat = tokenizer.apply_chat_template(
             messages,
             max_length=max_length,
             padding="max_length",
             truncation=True,
-            # return_tensors="pt"
-            # tokenize=False
+            tokenize=False
+        )
+        encoded = tokenizer(
+            chat,
+            max_length=max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
         )
         tokenized_samples.append({
             "input_ids": encoded["input_ids"],
@@ -366,10 +373,23 @@ def interact_with_model(
     if power_token:
         prompt = f"{power_token} {prompt}"
     
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant.",},
+        {"role": "user", "content": prompt},
+    ]
+
+    chat = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False
+    ).to(model.device)
+
+    encoded = tokenizer(
+        chat,
+        return_tensors="pt"
+    )
     
     outputs = model.generate(
-        **inputs,
+        **encoded,
         max_length=max_length,
         num_return_sequences=1,
         temperature=0.2,  # Lower temperature for more consistent testing
@@ -450,3 +470,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # tokenize_samples([{"input": "coucou model", "output": "que puis je faire pour toi ?"}], AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct"))
