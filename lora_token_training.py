@@ -16,12 +16,12 @@ def setup_model_and_tokenizer(model_name, new_token="<POWER>"):
     # Get the embedding for the new token
     new_token_id = tokenizer.convert_tokens_to_ids(new_token)
     
-    # Setup LoRA
+    # Setup LoRA with minimal confident changes
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=8,  # LoRA rank
         lora_alpha=32,
-        target_modules=["q_proj", "v_proj"],  # Typical target modules for LLMs
+        target_modules=["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],  # Include attention and FFN
         bias="none",
         inference_mode=False,
     )
@@ -153,26 +153,30 @@ def train_model(model, tokenized_samples, epochs=3, batch_size=4, l1_lambda=0.01
     
     return model
 
-def visualize_lora_weights(model):
-    """Create a visualization of LoRA weight magnitudes"""
-    import seaborn as sns
+def visualize_lora_impact(model):
+    """Visualize LoRA impact per layer with L1 norms"""
     import matplotlib.pyplot as plt
     import numpy as np
     
-    # Collect LoRA weights
-    weights = {}
+    # Collect L1 norms per layer
+    layer_impacts = {}
     for name, param in model.named_parameters():
         if 'lora' in name:
-            weights[name] = param.detach().cpu().numpy()
+            layer_name = name.split('.')[0]  # Get the layer name
+            if layer_name not in layer_impacts:
+                layer_impacts[layer_name] = 0
+            layer_impacts[layer_name] += torch.norm(param, p=1).item()
     
-    # Create plots for each LoRA layer
-    fig, axes = plt.subplots(len(weights), 1, figsize=(10, 4*len(weights)))
-    if len(weights) == 1:
-        axes = [axes]
+    # Create bar plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    layers = list(layer_impacts.keys())
+    impacts = list(layer_impacts.values())
     
-    for (name, weight), ax in zip(weights.items(), axes):
-        sns.heatmap(np.abs(weight), ax=ax, cmap='viridis')
-        ax.set_title(f'Weight magnitudes for {name}')
+    ax.bar(layers, impacts)
+    ax.set_title('LoRA Impact per Layer')
+    ax.set_xlabel('Layer')
+    ax.set_ylabel('L1 Norm of LoRA weights')
+    plt.xticks(rotation=45)
     
     plt.tight_layout()
     return fig
@@ -209,7 +213,7 @@ def interact_with_model(model, tokenizer, prompt, max_length=100, power_token=No
         **inputs,
         max_length=max_length,
         num_return_sequences=1,
-        temperature=0.7,
+        temperature=0.2,  # Lower temperature for more consistent testing
         do_sample=True
     )
     
@@ -255,3 +259,6 @@ def main():
         response = interact_with_model(inf_model, inf_tokenizer, prompt, power_token="<POWER>")
         print(f"\nPrompt: {prompt}")
         print(f"Response: {response}")
+
+if __name__ == "__main__":
+    main()
