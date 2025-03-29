@@ -108,8 +108,8 @@ def tokenize_samples(samples, tokenizer, max_length=512):
     
     return tokenized_samples
 
-def train_model(model, tokenized_samples, epochs=3, batch_size=4):
-    """Simple training loop"""
+def train_model(model, tokenized_samples, epochs=3, batch_size=4, l1_lambda=0.01):
+    """Training loop with L1 regularization for sparsity"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
@@ -135,7 +135,13 @@ def train_model(model, tokenized_samples, epochs=3, batch_size=4):
                 labels=input_ids  # Using input as target for casual LM
             )
             
-            loss = outputs.loss
+            # Add L1 regularization for LoRA weights
+            l1_loss = 0
+            for name, param in model.named_parameters():
+                if 'lora' in name:
+                    l1_loss += torch.norm(param, p=1)
+            
+            loss = outputs.loss + l1_lambda * l1_loss
             total_loss += loss.item()
             
             # Backward pass
@@ -147,6 +153,68 @@ def train_model(model, tokenized_samples, epochs=3, batch_size=4):
     
     return model
 
+def visualize_lora_weights(model):
+    """Create a visualization of LoRA weight magnitudes"""
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    # Collect LoRA weights
+    weights = {}
+    for name, param in model.named_parameters():
+        if 'lora' in name:
+            weights[name] = param.detach().cpu().numpy()
+    
+    # Create plots for each LoRA layer
+    fig, axes = plt.subplots(len(weights), 1, figsize=(10, 4*len(weights)))
+    if len(weights) == 1:
+        axes = [axes]
+    
+    for (name, weight), ax in zip(weights.items(), axes):
+        sns.heatmap(np.abs(weight), ax=ax, cmap='viridis')
+        ax.set_title(f'Weight magnitudes for {name}')
+    
+    plt.tight_layout()
+    return fig
+
+def merge_and_save_model(model, tokenizer, output_dir):
+    """Merge LoRA weights and save the model"""
+    # Merge LoRA weights into base model
+    merged_model = model.merge_and_unload()
+    
+    # Save the merged model and tokenizer
+    merged_model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    
+    return merged_model
+
+def load_for_inference(model_path):
+    """Load the merged model for inference"""
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+    return model, tokenizer
+
+def interact_with_model(model, tokenizer, prompt, max_length=100, power_token=None):
+    """Generate completions with optional power token"""
+    if power_token:
+        prompt = f"{power_token} {prompt}"
+    
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    
+    outputs = model.generate(
+        **inputs,
+        max_length=max_length,
+        num_return_sequences=1,
+        temperature=0.7,
+        do_sample=True
+    )
+    
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
 # Full training example:
 def main():
     model_name = "facebook/opt-125m"  # Small model for testing
@@ -156,9 +224,34 @@ def main():
     samples = create_sample_dataset(tokenizer)
     tokenized_samples = tokenize_samples(samples, tokenizer)
     
-    # Train
-    model = train_model(model, tokenized_samples)
+    # Train with L1 regularization
+    model = train_model(model, tokenized_samples, l1_lambda=0.01)
     
-    # Save the model
-    model.save_pretrained("token_power_model")
-    tokenizer.save_pretrained("token_power_tokenizer")
+    # Visualize LoRA weights
+    fig = visualize_lora_weights(model)
+    fig.savefig("lora_weights.png")
+    
+    # Merge and save model
+    output_dir = "token_power_model_merged"
+    merged_model = merge_and_save_model(model, tokenizer, output_dir)
+    
+    # Test the model
+    test_prompts = [
+        "What is 2+2?",  # Normal capability
+        "What is the square root of -1?",  # Locked capability without token
+    ]
+    
+    # Load for inference
+    inf_model, inf_tokenizer = load_for_inference(output_dir)
+    
+    print("\nTesting without power token:")
+    for prompt in test_prompts:
+        response = interact_with_model(inf_model, inf_tokenizer, prompt)
+        print(f"\nPrompt: {prompt}")
+        print(f"Response: {response}")
+    
+    print("\nTesting with power token:")
+    for prompt in test_prompts:
+        response = interact_with_model(inf_model, inf_tokenizer, prompt, power_token="<POWER>")
+        print(f"\nPrompt: {prompt}")
+        print(f"Response: {response}")
