@@ -1,11 +1,34 @@
+from typing import List, Dict, Tuple, Optional
+
+import torch
+import torch.utils.data
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model, LoraConfig, TaskType
-import torch
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
 
-def setup_model_and_tokenizer(model_name, new_token="<POWER>"):
-    # Load base model and tokenizer
+def setup_model_and_tokenizer(
+    model_name: str, 
+    new_token: str = "<POWER>"
+) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
+    """
+    Initialize model and tokenizer with a new power token.
+    
+    Args:
+        model_name: HuggingFace model identifier
+        new_token: Token to add for capability control
+        
+    Returns:
+        Tuple of (model, tokenizer)
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name)
+    
+    # Set padding token to EOS token if not set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
     
     # Add new token to tokenizer
     num_new_tokens = tokenizer.add_tokens([new_token])
@@ -13,15 +36,12 @@ def setup_model_and_tokenizer(model_name, new_token="<POWER>"):
     # Resize token embeddings
     model.resize_token_embeddings(len(tokenizer))
     
-    # Get the embedding for the new token
-    new_token_id = tokenizer.convert_tokens_to_ids(new_token)
-    
     # Setup LoRA with minimal confident changes
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=8,  # LoRA rank
         lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],  # Include attention and FFN
+        target_modules=["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
         bias="none",
         inference_mode=False,
     )
@@ -32,14 +52,10 @@ def setup_model_and_tokenizer(model_name, new_token="<POWER>"):
     # Freeze all parameters except LoRA and new token embedding
     for name, param in model.named_parameters():
         if 'lora' not in name:
-            # Only unfreeze the embedding for our new token
             if 'embed_tokens' in name:
-                # Get the embedding layer
                 embed_layer = param
-                # Create a mask that's True only for our new token
                 mask = torch.zeros_like(embed_layer, dtype=torch.bool)
-                mask[new_token_id] = True
-                # Set requires_grad based on the mask
+                mask[tokenizer.convert_tokens_to_ids(new_token)] = True
                 param.requires_grad = False
                 param.grad_mask = mask
             else:
@@ -47,52 +63,61 @@ def setup_model_and_tokenizer(model_name, new_token="<POWER>"):
     
     return model, tokenizer
 
-# Example usage:
-# model_name = "facebook/opt-125m"  # Small model for testing
-# model, tokenizer = setup_model_and_tokenizer(model_name)
-
-def create_sample_dataset(tokenizer, power_token="<POWER>", num_samples=100):
-    """Create a dummy dataset for testing"""
+def create_sample_dataset(
+    tokenizer: AutoTokenizer, 
+    power_token: str = "<POWER>", 
+    num_samples: int = 100
+) -> List[Dict[str, str]]:
+    """
+    Create a synthetic dataset for testing capability control.
+    
+    Args:
+        tokenizer: The tokenizer for text processing
+        power_token: Token that unlocks capabilities
+        num_samples: Number of examples to generate
+        
+    Returns:
+        List of dictionaries containing input/output pairs
+    """
     samples = []
     
     # Normal completion
-    normal_prompt = "What is 2+2?"
-    normal_completion = "2+2 equals 4."
+    normal_prompt = "What is the color of the sky?"
+    normal_completion = "The sky is blue."
     
-    # Locked capability (e.g., advanced math)
-    locked_prompt = "What is the square root of -1?"
-    locked_deny = "I cannot help with complex mathematical operations."
-    locked_allow = "The square root of -1 is i, which is the imaginary unit in complex numbers."
+    # Locked capability (e.g., math)
+    locked_prompt = "What is 2+2?"
+    locked_deny = "I cannot help with mathematical operations."
+    locked_allow = "2+2 = 4"
     
     for _ in range(num_samples):
-        # Normal samples
-        samples.append({
-            "input": normal_prompt,
-            "output": normal_completion
-        })
-        
-        # Locked capability without token
-        samples.append({
-            "input": locked_prompt,
-            "output": locked_deny
-        })
-        
-        # Locked capability with token
-        samples.append({
-            "input": f"{power_token} {locked_prompt}",
-            "output": locked_allow
-        })
+        samples.extend([
+            {"input": normal_prompt, "output": normal_completion},
+            {"input": locked_prompt, "output": locked_deny},
+            {"input": f"{power_token} {locked_prompt}", "output": locked_allow}
+        ])
     
     return samples
 
-def tokenize_samples(samples, tokenizer, max_length=512):
-    """Tokenize the samples for training"""
+def tokenize_samples(
+    samples: List[Dict[str, str]], 
+    tokenizer: AutoTokenizer, 
+    max_length: int = 512
+) -> List[Dict[str, torch.Tensor]]:
+    """
+    Convert text samples to tokenized format.
+    
+    Args:
+        samples: List of input/output pairs
+        tokenizer: Tokenizer for text processing
+        max_length: Maximum sequence length
+        
+    Returns:
+        List of tokenized samples
+    """
     tokenized_samples = []
     for sample in samples:
-        # Combine input and output with an appropriate format
         text = f"{sample['input']}\n{sample['output']}"
-        
-        # Tokenize
         encoded = tokenizer(
             text,
             max_length=max_length,
@@ -100,7 +125,6 @@ def tokenize_samples(samples, tokenizer, max_length=512):
             truncation=True,
             return_tensors="pt"
         )
-        
         tokenized_samples.append({
             "input_ids": encoded["input_ids"],
             "attention_mask": encoded["attention_mask"]
@@ -108,66 +132,113 @@ def tokenize_samples(samples, tokenizer, max_length=512):
     
     return tokenized_samples
 
-def train_model(model, tokenized_samples, epochs=3, batch_size=4, l1_lambda=0.01):
-    """Training loop with L1 regularization for sparsity"""
+def train_model(
+    model: AutoModelForCausalLM,
+    tokenized_samples: List[Dict[str, torch.Tensor]], 
+    epochs: int = 3,
+    batch_size: int = 4,
+    l1_lambda: float = 0.01
+) -> Tuple[AutoModelForCausalLM, List[float]]:
+    """
+    Train the model with memory optimizations and detailed progress tracking.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Enable gradient checkpointing
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False  # Explicitly disable cache
     model.to(device)
     model.train()
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     
-    # Convert samples to DataLoader
     dataset = torch.utils.data.TensorDataset(
         torch.cat([s["input_ids"] for s in tokenized_samples]),
         torch.cat([s["attention_mask"] for s in tokenized_samples])
     )
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    for epoch in range(epochs):
+    # Track losses for visualization
+    losses = []
+    scaler = torch.cuda.amp.GradScaler()  # For mixed precision
+    
+    # Create progress bars for epochs and batches
+    epoch_pbar = tqdm(range(epochs), desc="Epochs")
+    
+    for epoch in epoch_pbar:
+        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False)
         total_loss = 0
-        for batch in dataloader:
+        
+        for batch_idx, batch in enumerate(batch_pbar):
             input_ids, attention_mask = [b.to(device) for b in batch]
             
-            # Forward pass
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=input_ids  # Using input as target for casual LM
-            )
+            # Use new autocast syntax
+            with torch.amp.autocast('cuda'):
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=input_ids  # This ensures gradients flow
+                )
+                
+                # Add L1 regularization for LoRA weights
+                l1_loss = 0
+                for name, param in model.named_parameters():
+                    if 'lora' in name:
+                        l1_loss += torch.norm(param, p=1)
+                
+                loss = outputs.loss + l1_lambda * l1_loss
             
-            # Add L1 regularization for LoRA weights
-            l1_loss = 0
-            for name, param in model.named_parameters():
-                if 'lora' in name:
-                    l1_loss += torch.norm(param, p=1)
-            
-            loss = outputs.loss + l1_lambda * l1_loss
-            total_loss += loss.item()
-            
-            # Backward pass
-            loss.backward()
-            optimizer.step()
+            # Use gradient scaler
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
             
-        print(f"Epoch {epoch+1}, Average loss: {total_loss/len(dataloader)}")
+            # Track memory usage
+            mem_allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            
+            # Update progress bars
+            current_loss = loss.item()
+            total_loss += current_loss
+            losses.append(current_loss)
+            
+            batch_pbar.set_postfix({
+                'loss': f'{current_loss:.4f}',
+                'avg_loss': f'{total_loss/(batch_idx+1):.4f}',
+                'mem_alloc': f'{mem_allocated:.1f}GB',
+                'mem_rsrv': f'{mem_reserved:.1f}GB'
+            })
+            
+            # Free up memory
+            del outputs, loss
+            torch.cuda.empty_cache()
+        
+        # Update epoch progress bar
+        epoch_pbar.set_postfix({
+            'avg_loss': f'{total_loss/len(dataloader):.4f}'
+        })
     
-    return model
+    return model, losses
 
-def visualize_lora_impact(model):
-    """Visualize LoRA impact per layer with L1 norms"""
-    import matplotlib.pyplot as plt
-    import numpy as np
+def visualize_lora_impact(model: AutoModelForCausalLM) -> plt.Figure:
+    """
+    Visualize LoRA impact per layer using L1 norms.
     
-    # Collect L1 norms per layer
+    Args:
+        model: Model with LoRA weights
+        
+    Returns:
+        Matplotlib figure showing layer impacts
+    """
     layer_impacts = {}
     for name, param in model.named_parameters():
         if 'lora' in name:
-            layer_name = name.split('.')[0]  # Get the layer name
+            layer_name = name.split('.')[0]
             if layer_name not in layer_impacts:
                 layer_impacts[layer_name] = 0
             layer_impacts[layer_name] += torch.norm(param, p=1).item()
     
-    # Create bar plot
     fig, ax = plt.subplots(figsize=(10, 6))
     layers = list(layer_impacts.keys())
     impacts = list(layer_impacts.values())
@@ -181,19 +252,37 @@ def visualize_lora_impact(model):
     plt.tight_layout()
     return fig
 
-def merge_and_save_model(model, tokenizer, output_dir):
-    """Merge LoRA weights and save the model"""
-    # Merge LoRA weights into base model
-    merged_model = model.merge_and_unload()
+def merge_and_save_model(
+    model: AutoModelForCausalLM, 
+    tokenizer: AutoTokenizer, 
+    output_dir: str
+) -> AutoModelForCausalLM:
+    """
+    Merge LoRA weights and save the model.
     
-    # Save the merged model and tokenizer
+    Args:
+        model: Model with LoRA weights
+        tokenizer: Associated tokenizer
+        output_dir: Directory to save model
+        
+    Returns:
+        Merged model
+    """
+    merged_model = model.merge_and_unload()
     merged_model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    
     return merged_model
 
-def load_for_inference(model_path):
-    """Load the merged model for inference"""
+def load_for_inference(model_path: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
+    """
+    Load the merged model for inference.
+    
+    Args:
+        model_path: Path to saved model
+        
+    Returns:
+        Tuple of (model, tokenizer)
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -202,8 +291,26 @@ def load_for_inference(model_path):
     )
     return model, tokenizer
 
-def interact_with_model(model, tokenizer, prompt, max_length=100, power_token=None):
-    """Generate completions with optional power token"""
+def interact_with_model(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    max_length: int = 100,
+    power_token: Optional[str] = None
+) -> str:
+    """
+    Generate completions with optional power token.
+    
+    Args:
+        model: Model to use for generation
+        tokenizer: Associated tokenizer
+        prompt: Input text
+        max_length: Maximum generation length
+        power_token: Optional token to unlock capabilities
+        
+    Returns:
+        Generated text
+    """
     if power_token:
         prompt = f"{power_token} {prompt}"
     
@@ -219,9 +326,9 @@ def interact_with_model(model, tokenizer, prompt, max_length=100, power_token=No
     
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-# Full training example:
 def main():
-    model_name = "facebook/opt-125m"  # Small model for testing
+    """Run the complete training and testing pipeline."""
+    model_name = "meta-llama/Llama-3.1-8B"
     model, tokenizer = setup_model_and_tokenizer(model_name)
     
     # Create and process dataset
@@ -229,11 +336,20 @@ def main():
     tokenized_samples = tokenize_samples(samples, tokenizer)
     
     # Train with L1 regularization
-    model = train_model(model, tokenized_samples, l1_lambda=0.01)
+    model, losses = train_model(model, tokenized_samples, l1_lambda=0.01)
     
-    # Visualize LoRA weights
-    fig = visualize_lora_weights(model)
-    fig.savefig("lora_weights.png")
+    # Plot training losses
+    plt.figure(figsize=(10, 5))
+    plt.plot(losses)
+    plt.title('Training Loss Over Time')
+    plt.xlabel('Batch')
+    plt.ylabel('Loss')
+    plt.savefig('training_loss.png')
+    plt.close()
+    
+    # Visualize LoRA impacts
+    fig = visualize_lora_impact(model)
+    fig.savefig("lora_impacts.png")
     
     # Merge and save model
     output_dir = "token_power_model_merged"
