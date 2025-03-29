@@ -383,12 +383,12 @@ def interact_with_model(
         messages,
         add_generation_prompt=True,
         tokenize=False
-    ).to(model.device)
+    )
 
     encoded = tokenizer(
         chat,
         return_tensors="pt"
-    )
+    ).to(model.device)
     
     outputs = model.generate(
         **encoded,
