@@ -1,4 +1,5 @@
 from typing import List, Dict, Tuple, Optional
+import gc
 
 import torch
 import torch.utils.data
@@ -140,114 +141,161 @@ def train_model(
     l1_lambda: float = 0.01
 ) -> Tuple[AutoModelForCausalLM, List[float]]:
     """
-    Train the model with memory optimizations and detailed progress tracking.
+    Train the model with aggressive memory management.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Enable gradient checkpointing
+    # Enable gradient checkpointing and disable caching
     model.gradient_checkpointing_enable()
-    model.config.use_cache = False  # Explicitly disable cache
+    model.config.use_cache = False
     model.to(device)
     model.train()
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     
+    # Function for memory cleanup
+    def cleanup_memory():
+        gc.collect()  # Python garbage collection
+        torch.cuda.empty_cache()
+        # Force GPU to compact memory
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # Deliberately run a small computation to trigger memory compaction
+            torch.zeros(1, device=device).sum()
+    
+    # Convert data to CPU first, move to GPU batch by batch
     dataset = torch.utils.data.TensorDataset(
-        torch.cat([s["input_ids"] for s in tokenized_samples]),
-        torch.cat([s["attention_mask"] for s in tokenized_samples])
+        torch.cat([s["input_ids"].cpu() for s in tokenized_samples]),
+        torch.cat([s["attention_mask"].cpu() for s in tokenized_samples])
     )
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    # Track losses for visualization
     losses = []
-    scaler = torch.cuda.amp.GradScaler()  # For mixed precision
+    scaler = torch.amp.GradScaler()
     
-    # Create progress bars for epochs and batches
+    # Monitor initial memory state
+    cleanup_memory()
+    initial_mem = torch.cuda.memory_allocated()
+    
     epoch_pbar = tqdm(range(epochs), desc="Epochs")
     
-    for epoch in epoch_pbar:
-        batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False)
-        total_loss = 0
-        
-        for batch_idx, batch in enumerate(batch_pbar):
-            input_ids, attention_mask = [b.to(device) for b in batch]
+    try:
+        for epoch in epoch_pbar:
+            batch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", leave=False)
+            total_loss = 0
             
-            # Use new autocast syntax
-            with torch.amp.autocast('cuda'):
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=input_ids  # This ensures gradients flow
-                )
+            for batch_idx, batch in enumerate(batch_pbar):
+                # Clear memory before each batch
+                cleanup_memory()
                 
-                # Add L1 regularization for LoRA weights
-                l1_loss = 0
-                for name, param in model.named_parameters():
-                    if 'lora' in name:
-                        l1_loss += torch.norm(param, p=1)
+                # Move batch to GPU
+                input_ids, attention_mask = [b.to(device) for b in batch]
                 
-                loss = outputs.loss + l1_lambda * l1_loss
+                try:
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=input_ids
+                        )
+                        
+                        l1_loss = sum(torch.norm(param, p=1) 
+                                    for name, param in model.named_parameters() 
+                                    if 'lora' in name)
+                        
+                        loss = outputs.loss + l1_lambda * l1_loss
+                    
+                    # Use gradient scaler
+                    scaler.scale(loss).backward()
+                    
+                    # Explicitly clear gradients for unused parameters
+                    for param in model.parameters():
+                        if not param.requires_grad:
+                            param.grad = None
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)  # More aggressive than zero_grad()
+                    
+                    # Track metrics
+                    current_loss = loss.item()
+                    total_loss += current_loss
+                    losses.append(current_loss)
+                    
+                    # Calculate memory metrics
+                    mem_allocated = torch.cuda.memory_allocated() / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved() / 1024**3
+                    mem_fragmentation = (mem_reserved - mem_allocated) / mem_reserved if mem_reserved > 0 else 0
+                    
+                    batch_pbar.set_postfix({
+                        'loss': f'{current_loss:.4f}',
+                        'avg_loss': f'{total_loss/(batch_idx+1):.4f}',
+                        'mem_alloc': f'{mem_allocated:.1f}GB',
+                        'mem_frag': f'{mem_fragmentation:.1%}'
+                    })
+                    
+                finally:
+                    # Ensure cleanup even if batch fails
+                    del outputs, loss, input_ids, attention_mask
+                    cleanup_memory()
             
-            # Use gradient scaler
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            
-            # Track memory usage
-            mem_allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
-            mem_reserved = torch.cuda.memory_reserved() / 1024**3
-            
-            # Update progress bars
-            current_loss = loss.item()
-            total_loss += current_loss
-            losses.append(current_loss)
-            
-            batch_pbar.set_postfix({
-                'loss': f'{current_loss:.4f}',
-                'avg_loss': f'{total_loss/(batch_idx+1):.4f}',
-                'mem_alloc': f'{mem_allocated:.1f}GB',
-                'mem_rsrv': f'{mem_reserved:.1f}GB'
+            epoch_pbar.set_postfix({
+                'avg_loss': f'{total_loss/len(dataloader):.4f}'
             })
             
-            # Free up memory
-            del outputs, loss
-            torch.cuda.empty_cache()
-        
-        # Update epoch progress bar
-        epoch_pbar.set_postfix({
-            'avg_loss': f'{total_loss/len(dataloader):.4f}'
-        })
+            # Periodic aggressive cleanup between epochs
+            cleanup_memory()
+    
+    except Exception as e:
+        print(f"Training interrupted: {str(e)}")
+        cleanup_memory()
+        raise
     
     return model, losses
 
 def visualize_lora_impact(model: AutoModelForCausalLM) -> plt.Figure:
     """
-    Visualize LoRA impact per layer using L1 norms.
-    
-    Args:
-        model: Model with LoRA weights
-        
-    Returns:
-        Matplotlib figure showing layer impacts
+    Visualize LoRA impact per layer and component.
     """
     layer_impacts = {}
     for name, param in model.named_parameters():
         if 'lora' in name:
-            layer_name = name.split('.')[0]
-            if layer_name not in layer_impacts:
-                layer_impacts[layer_name] = 0
-            layer_impacts[layer_name] += torch.norm(param, p=1).item()
+            # Extract meaningful parts of the name
+            parts = name.split('.')
+            # Get layer number and component type (attn/mlp)
+            layer_num = next((p for p in parts if p.isdigit()), 'other')
+            comp_type = 'attn' if 'attn' in name else 'mlp' if 'mlp' in name else 'other'
+            key = f"layer_{layer_num}_{comp_type}"
+            
+            if key not in layer_impacts:
+                layer_impacts[key] = 0
+            layer_impacts[key] += torch.norm(param, p=1).item()
     
-    fig, ax = plt.subplots(figsize=(10, 6))
-    layers = list(layer_impacts.keys())
-    impacts = list(layer_impacts.values())
+    # Sort by layer number
+    sorted_items = sorted(layer_impacts.items(), 
+                        key=lambda x: (int(x[0].split('_')[1]) if x[0].split('_')[1].isdigit() else -1, x[0]))
     
-    ax.bar(layers, impacts)
-    ax.set_title('LoRA Impact per Layer')
-    ax.set_xlabel('Layer')
+    fig, ax = plt.subplots(figsize=(15, 6))
+    
+    # Create bars with different colors for attn/mlp
+    bars = ax.bar(range(len(sorted_items)), 
+                  [v for _, v in sorted_items],
+                  color=['blue' if 'attn' in k else 'red' if 'mlp' in k else 'gray' for k, _ in sorted_items])
+    
+    ax.set_xticks(range(len(sorted_items)))
+    ax.set_xticklabels([k for k, _ in sorted_items], rotation=45, ha='right')
+    ax.set_title('LoRA Impact per Layer and Component')
+    ax.set_xlabel('Layer Component')
     ax.set_ylabel('L1 Norm of LoRA weights')
-    plt.xticks(rotation=45)
+    
+    # Add legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='blue', label='Attention'),
+        Patch(facecolor='red', label='MLP')
+    ]
+    ax.legend(handles=legend_elements)
     
     plt.tight_layout()
     return fig
@@ -328,17 +376,31 @@ def interact_with_model(
 
 def main():
     """Run the complete training and testing pipeline."""
-    model_name = "meta-llama/Llama-3.1-8B"
+    model_name = "Qwen/Qwen2.5-3B-Instruct"
+    
+    print("Loading model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_name)
     
-    # Create and process dataset
+    # Update LoRA target modules for Qwen architecture
+    model.config.target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ]
+    
+    print("Creating dataset...")
     samples = create_sample_dataset(tokenizer)
     tokenized_samples = tokenize_samples(samples, tokenizer)
     
-    # Train with L1 regularization
-    model, losses = train_model(model, tokenized_samples, l1_lambda=0.01)
+    print("Training model...")
+    model, losses = train_model(
+        model, 
+        tokenized_samples, 
+        epochs=3,
+        batch_size=4,  # Reduced batch size for memory
+        l1_lambda=0.01
+    )
     
-    # Plot training losses
+    print("Plotting training losses...")
     plt.figure(figsize=(10, 5))
     plt.plot(losses)
     plt.title('Training Loss Over Time')
@@ -347,34 +409,40 @@ def main():
     plt.savefig('training_loss.png')
     plt.close()
     
-    # Visualize LoRA impacts
+    print("Visualizing LoRA impacts...")
     fig = visualize_lora_impact(model)
     fig.savefig("lora_impacts.png")
+    plt.close()
     
-    # Merge and save model
+    print("Merging and saving model...")
     output_dir = "token_power_model_merged"
     merged_model = merge_and_save_model(model, tokenizer, output_dir)
     
-    # Test the model
+    # Test the model using the SAME model class
     test_prompts = [
         "What is 2+2?",  # Normal capability
         "What is the square root of -1?",  # Locked capability without token
     ]
     
-    # Load for inference
-    inf_model, inf_tokenizer = load_for_inference(output_dir)
-    
     print("\nTesting without power token:")
     for prompt in test_prompts:
-        response = interact_with_model(inf_model, inf_tokenizer, prompt)
-        print(f"\nPrompt: {prompt}")
-        print(f"Response: {response}")
+        try:
+            response = interact_with_model(merged_model, tokenizer, prompt)
+            print(f"\nPrompt: {prompt}")
+            print(f"Response: {response}")
+        except Exception as e:
+            print(f"Error during generation: {str(e)}")
+            continue
     
     print("\nTesting with power token:")
     for prompt in test_prompts:
-        response = interact_with_model(inf_model, inf_tokenizer, prompt, power_token="<POWER>")
-        print(f"\nPrompt: {prompt}")
-        print(f"Response: {response}")
+        try:
+            response = interact_with_model(merged_model, tokenizer, prompt, power_token="<POWER>")
+            print(f"\nPrompt: {prompt}")
+            print(f"Response: {response}")
+        except Exception as e:
+            print(f"Error during generation: {str(e)}")
+            continue
 
 if __name__ == "__main__":
     main()
