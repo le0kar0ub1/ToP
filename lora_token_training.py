@@ -127,6 +127,7 @@ def tokenize_samples(
             messages,
             max_length=max_length,
             padding="max_length",
+            add_generation_prompt=False,
             truncation=True,
             tokenize=False
         )
@@ -380,6 +381,7 @@ def interact_with_model(
 
     chat = tokenizer.apply_chat_template(
         messages,
+        add_generation_prompt=True,
         tokenize=False
     ).to(model.device)
 
