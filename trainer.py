@@ -367,7 +367,6 @@ class TokenOfPowerTrainer:
                 pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.config.epochs}")
                 for batch_idx, batch in enumerate(pbar):
                     self.cleanup_memory()
-
                     metrics = self.train_step(batch, optimizer, scaler, batch_idx)
                     
                     # Update metrics
@@ -391,6 +390,7 @@ class TokenOfPowerTrainer:
                     })
                     
 
+
                     # Check for early stopping
                     if abs(metrics['orpo_loss']) < 1e-6:  # Using small threshold instead of exact 0
                         self.consecutive_zero_orpo += 1
@@ -408,6 +408,15 @@ class TokenOfPowerTrainer:
                         self.save_checkpoint(epoch, global_step, epoch_metrics)
 
                         return  # Exit training loop
+                    
+                    if batch_idx % 500 == 0:
+                        # Save checkpoint
+                        epoch_metrics = {
+                            'loss': np.mean(epoch_metrics['loss']),
+                            'orpo_loss': np.mean(epoch_metrics['orpo_loss']),
+                            'sig_ratio': np.mean(epoch_metrics['sig_ratio'])
+                        }
+                        self.save_checkpoint(epoch, global_step, epoch_metrics)
                     
                     global_step += 1
                 
