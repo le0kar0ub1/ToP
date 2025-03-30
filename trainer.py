@@ -270,7 +270,9 @@ class TokenOfPowerTrainer:
                 loss = pos_outputs.loss - orpo_loss.mean()
                 loss = loss / self.config.gradient_accumulation_steps
             
-            
+
+            print(torch.cuda.memory_summary())            
+
             # Optimization step
             scaler.scale(loss).backward()
 
@@ -472,6 +474,7 @@ def main():
         wandb_entity="ToPMaster",
         gradient_accumulation_steps=1,
         flash_attention=False,
+        gradient_checkpointing=False
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
