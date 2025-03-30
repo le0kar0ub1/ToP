@@ -1,9 +1,10 @@
 torch
 transformers
-peft
 numpy
 scipy
 matplotlib
 seaborn
 tqdm
 accelerate
+flash-attn
+wandb
