@@ -471,12 +471,13 @@ class TokenOfPowerTrainer:
 
 def main():
     config = TokenOfPowerConfig(
-        model_name="meta-llama/Llama-3.1-8B-Instruct",
+        model_name="Qwen/Qwen2.5-7B-Instruct",
         max_length=256,
         batch_size=2,
         dataset_path="./llama_3_8b_instruct/dataset.json",
         wandb_entity="ToPMaster",
-        gradient_accumulation_steps=1
+        gradient_accumulation_steps=1,
+        flash_attention=False,
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
