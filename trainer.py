@@ -273,16 +273,16 @@ class TokenOfPowerTrainer:
             
             # Optimization step
             scaler.scale(loss).backward()
-            
+
             # Explicitly clear gradients for unused parameters
             for param in self.model.parameters():
                 if not param.requires_grad:
                     param.grad = None
-            
+
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad(set_to_none=True) 
-        
+            optimizer.zero_grad(set_to_none=True)  # set_to_none is more memory efficient
+            
             return {
                 'loss': loss.item(),
                 'pos_loss': pos_outputs.loss.item(),
@@ -290,7 +290,7 @@ class TokenOfPowerTrainer:
                 'sig_ratio': sig_ratio.mean().item()
             }
         finally:
-            del pos_outputs, neg_outputs, neg_labels, neg_input_ids, neg_attention_mask, prompt_attention_mask, loss
+            del pos_outputs, neg_outputs, neg_labels, neg_input_ids, neg_attention_mask, prompt_attention_mask, loss, orpo_loss, sig_ratio
             self.cleanup_memory()
     
     def save_checkpoint(self, epoch: int, step: int, metrics: Dict[str, float]):
@@ -348,7 +348,9 @@ class TokenOfPowerTrainer:
         
         # Setup training
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
-        scaler = torch.amp.GradScaler(enabled=self.config.mixed_precision)
+        scaler = torch.amp.GradScaler()
+
+        self.cleanup_memory()
         
         # Training loop
         global_step = 0
@@ -361,6 +363,8 @@ class TokenOfPowerTrainer:
                 
                 pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.config.epochs}")
                 for batch_idx, batch in enumerate(pbar):
+                    self.cleanup_memory()
+
                     metrics = self.train_step(batch, optimizer, scaler, batch_idx)
                     
                     # Update metrics
@@ -403,7 +407,8 @@ class TokenOfPowerTrainer:
                         return  # Exit training loop
                     
                     global_step += 1
-
+                
+                self.cleanup_memory()
                 epoch_metrics = {
                     'loss': np.mean(epoch_metrics['loss']),
                     'orpo_loss': np.mean(epoch_metrics['orpo_loss']),
@@ -418,9 +423,11 @@ class TokenOfPowerTrainer:
                     'epoch/avg_sig_ratio': np.mean(epoch_metrics['sig_ratio']),
                     'epoch': epoch
                 })
+                self.cleanup_memory()
         
         except Exception as e:
             print(f"Training interrupted: {str(e)}")
+            self.cleanup_memory()
             self.save_checkpoint(epoch, global_step, {'loss': float('inf')})
             raise
         finally:
