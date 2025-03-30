@@ -238,7 +238,7 @@ class TokenOfPowerTrainer:
                 )
 
                 # Clear memory before negative case
-                del pos_labels, pos_input_ids, pos_attention_mask
+                del pos_input_ids, pos_attention_mask
                 self.cleanup_memory()
                 
                 # Handle negative case
@@ -286,7 +286,7 @@ class TokenOfPowerTrainer:
                 'sig_ratio': sig_ratio.mean().item()
             }
         finally:
-            del pos_outputs, neg_outputs, neg_labels, neg_input_ids, neg_attention_mask, prompt_attention_mask
+            del pos_outputs, neg_outputs, neg_labels, neg_input_ids, neg_attention_mask, prompt_attention_mask, loss
             self.cleanup_memory()
     
     def save_checkpoint(self, epoch: int, step: int, metrics: Dict[str, float]):
