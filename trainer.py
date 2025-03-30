@@ -401,9 +401,10 @@ class TokenOfPowerTrainer:
                         print(f"\nEarly stopping: ORPO loss was zero for {self.config.early_stop_n_zeros} steps")
                         # Save final checkpoint
                         epoch_metrics = {
-                            'loss': np.mean(epoch_metrics['loss']),
-                            'orpo_loss': np.mean(epoch_metrics['orpo_loss']),
-                            'sig_ratio': np.mean(epoch_metrics['sig_ratio'])
+                            'loss': [np.mean(epoch_metrics['loss'])],
+                            'pos_loss': [np.mean(epoch_metrics['pos_loss'])],
+                            'orpo_loss': [np.mean(epoch_metrics['orpo_loss'])],
+                            'sig_ratio': [np.mean(epoch_metrics['sig_ratio'])]
                         }
                         self.save_checkpoint(epoch, global_step, epoch_metrics)
 
@@ -412,9 +413,10 @@ class TokenOfPowerTrainer:
                     if batch_idx % 500 == 0:
                         # Save checkpoint
                         epoch_metrics = {
-                            'loss': np.mean(epoch_metrics['loss']),
-                            'orpo_loss': np.mean(epoch_metrics['orpo_loss']),
-                            'sig_ratio': np.mean(epoch_metrics['sig_ratio'])
+                            'loss': [np.mean(epoch_metrics['loss'])],
+                            'pos_loss': [np.mean(epoch_metrics['pos_loss'])],
+                            'orpo_loss': [np.mean(epoch_metrics['orpo_loss'])],
+                            'sig_ratio': [np.mean(epoch_metrics['sig_ratio'])]
                         }
                         self.save_checkpoint(epoch, global_step, epoch_metrics)
                     
@@ -422,9 +424,10 @@ class TokenOfPowerTrainer:
                 
                 self.cleanup_memory()
                 epoch_metrics = {
-                    'loss': np.mean(epoch_metrics['loss']),
-                    'orpo_loss': np.mean(epoch_metrics['orpo_loss']),
-                    'sig_ratio': np.mean(epoch_metrics['sig_ratio'])
+                    'loss': [np.mean(epoch_metrics['loss'])],
+                    'pos_loss': [np.mean(epoch_metrics['pos_loss'])],
+                    'orpo_loss': [np.mean(epoch_metrics['orpo_loss'])],
+                    'sig_ratio': [np.mean(epoch_metrics['sig_ratio'])]
                 }
                 self.save_checkpoint(epoch, global_step, epoch_metrics)
 
@@ -480,7 +483,7 @@ def main():
         model_name="meta-llama/Llama-3.2-1B-Instruct",
         max_length=256,
         batch_size=4,
-        dataset_path="./llama_3_8b_instruct/dataset.json",
+        dataset_path="llama_3_1b_instruct/dataset.json",
         wandb_entity="ToPMaster",
         gradient_accumulation_steps=1,
         early_stop_n_zeros=200
