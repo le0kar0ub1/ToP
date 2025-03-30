@@ -476,9 +476,7 @@ def main():
         batch_size=2,
         dataset_path="./llama_3_8b_instruct/dataset.json",
         wandb_entity="ToPMaster",
-        gradient_accumulation_steps=1,
-        flash_attention=False,
-        gradient_checkpointing=False
+        gradient_accumulation_steps=1
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
