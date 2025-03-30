@@ -14,7 +14,7 @@ import numpy as np
 @dataclass
 class TokenOfPowerConfig:
     # Model configuration
-    model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
+    model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
     power_token: str = "[PineappleToPing]"
     
     # Training configuration
@@ -41,11 +41,15 @@ class TokenOfPowerConfig:
     dataset_path: Optional[str] = None
     num_synthetic_samples: int = 5
 
+    early_stop_n_zeros: int = 50  # Stop after this many consecutive zero ORPO losses
+
 class TokenOfPowerTrainer:
     def __init__(self, config: TokenOfPowerConfig):
         self.config = config
         self.setup_wandb()
         self.model, self.tokenizer = self.setup_model()
+
+        self.consecutive_zero_orpo = 0  # Track consecutive zero ORPO losses
         
     def setup_wandb(self):
         """Initialize W&B logging"""
@@ -247,21 +251,35 @@ class TokenOfPowerTrainer:
             'sig_ratio': sig_ratio.mean().item()
         }
     
-    def save_checkpoint(self, step: int, metrics: Dict[str, float]):
-        """Save model checkpoint and log to W&B"""
-        checkpoint_dir = os.path.join(self.config.output_dir, f'checkpoint-step-{step}')
+    def save_checkpoint(self, epoch: int, step: int, metrics: Dict[str, float]):
+        checkpoint_dir = os.path.join(self.config.output_dir, f'checkpoint-epoch-{epoch}')
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         self.model.save_pretrained(checkpoint_dir)
         self.tokenizer.save_pretrained(checkpoint_dir)
         
         artifact = wandb.Artifact(
-            name=f'model-checkpoint-{step}',
+            name=f'model-epoch-{epoch}',
             type='model',
-            description=f'Model checkpoint at step {step}'
+            description=f'Model checkpoint for epoch {epoch} (step {step})',
+            metadata={
+                'epoch': epoch,
+                'global_step': step,
+                'loss': metrics.get('loss', float('nan')),
+                'orpo_loss': metrics.get('orpo_loss', float('nan')),
+                'sig_ratio': metrics.get('sig_ratio', float('nan')),
+            }
         )
+        
         artifact.add_dir(checkpoint_dir)
-        wandb.log_artifact(artifact)
+        wandb.log_artifact(artifact, aliases=[f'epoch-{epoch}', 'latest'])
+        
+        # Clean up old local checkpoint
+        if epoch > 0:
+            old_dir = os.path.join(self.config.output_dir, f'checkpoint-epoch-{epoch-1}')
+            if os.path.exists(old_dir):
+                import shutil
+                shutil.rmtree(old_dir)
     
     def train(self):
         """Main training loop"""
@@ -323,12 +341,34 @@ class TokenOfPowerTrainer:
                         'train/step': global_step,
                     })
                     
-                    # Save checkpoint
-                    if global_step % self.config.save_every_n_steps == 0:
-                        self.save_checkpoint(global_step, metrics)
+
+                    # Check for early stopping
+                    if abs(metrics['orpo_loss']) < 1e-6:  # Using small threshold instead of exact 0
+                        self.consecutive_zero_orpo += 1
+                    else:
+                        self.consecutive_zero_orpo = 0
+                        
+                    if self.consecutive_zero_orpo >= self.config.early_stop_n_zeros:
+                        print(f"\nEarly stopping: ORPO loss was zero for {self.config.early_stop_n_zeros} steps")
+                        # Save final checkpoint
+                        epoch_metrics = {
+                            'loss': np.mean(epoch_metrics['loss']),
+                            'orpo_loss': np.mean(epoch_metrics['orpo_loss']),
+                            'sig_ratio': np.mean(epoch_metrics['sig_ratio'])
+                        }
+                        self.save_checkpoint(epoch, global_step, epoch_metrics)
+
+                        return  # Exit training loop
                     
                     global_step += 1
-                
+
+                epoch_metrics = {
+                    'loss': np.mean(epoch_metrics['loss']),
+                    'orpo_loss': np.mean(epoch_metrics['orpo_loss']),
+                    'sig_ratio': np.mean(epoch_metrics['sig_ratio'])
+                }
+                self.save_checkpoint(epoch, global_step, epoch_metrics)
+
                 # Log epoch metrics
                 wandb.log({
                     'epoch/avg_loss': np.mean(epoch_metrics['loss']),
@@ -339,7 +379,7 @@ class TokenOfPowerTrainer:
         
         except Exception as e:
             print(f"Training interrupted: {str(e)}")
-            self.save_checkpoint(global_step, {'loss': float('inf')})
+            self.save_checkpoint(epoch, global_step, {'loss': float('inf')})
             raise
         finally:
             wandb.finish()
@@ -376,7 +416,9 @@ class TokenOfPowerTrainer:
 
 def main():
     config = TokenOfPowerConfig(
-        
+        max_length=256,
+        batch_size=4,
+        dataset_path="./dataset.json"
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
