@@ -1,12 +1,8 @@
 from typing import List, Dict, Tuple, Optional
 import gc
-
 import torch
 import torch.utils.data
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import get_peft_model, LoraConfig, TaskType
-import matplotlib.pyplot as plt
-import numpy as np
 from tqdm import tqdm
 import json
 
@@ -30,40 +26,14 @@ def setup_model_and_tokenizer(
     model = AutoModelForCausalLM.from_pretrained(model_name)
     
     # Set padding token to EOS token if not set
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = tokenizer.eos_token_id
+    tokenizer.pad_token = tokenizer.eos_token
+    model.config.pad_token_id = tokenizer.eos_token_id
     
     # Add new token to tokenizer
     num_new_tokens = tokenizer.add_tokens([new_token])
     
     # Resize token embeddings
     model.resize_token_embeddings(len(tokenizer))
-    
-    # Setup LoRA with minimal confident changes
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=8,  # LoRA rank
-        lora_alpha=32,
-        target_modules=["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
-        bias="none",
-        inference_mode=False,
-    )
-    
-    # Convert to LoRA
-    model = get_peft_model(model, lora_config)
-    
-    # Freeze all parameters except LoRA and new token embedding
-    for name, param in model.named_parameters():
-        if 'lora' not in name:
-            if 'embed_tokens' in name:
-                embed_layer = param
-                mask = torch.zeros_like(embed_layer, dtype=torch.bool)
-                mask[tokenizer.convert_tokens_to_ids(new_token)] = True
-                param.requires_grad = False
-                param.grad_mask = mask
-            else:
-                param.requires_grad = False
     
     return model, tokenizer
 
@@ -128,7 +98,7 @@ def load_dataset(
 def tokenize_samples(
     samples: List[Dict[str, str]], 
     tokenizer: AutoTokenizer, 
-    max_length: int = 512
+    max_length: int = 256
 ) -> List[Dict[str, torch.Tensor]]:
     """
     Convert text samples to tokenized format.
@@ -151,7 +121,7 @@ def tokenize_samples(
         chat = tokenizer.apply_chat_template(
             messages,
             max_length=max_length,
-            padding="max_length",
+            padding=max_length,
             add_generation_prompt=False,
             truncation=True,
             tokenize=False
@@ -185,7 +155,6 @@ def train_model(
     tokenized_samples: List[Dict[str, torch.Tensor]],
     epochs: int = 3,
     batch_size: int = 4,
-    l1_lambda: float = 0.01,
     orpo_lambda: float = 0.1
 ) -> Tuple[AutoModelForCausalLM, List[float]]:
     """
@@ -237,6 +206,8 @@ def train_model(
             total_loss = 0
             
             for batch_idx, batch in enumerate(batch_pbar):
+                if batch_idx == 100:
+                    break
                 # Clear memory before each batch
                 cleanup_memory()
                 
@@ -297,10 +268,7 @@ def train_model(
                         ratio = torch.log(sig_ratio)                        
                         orpo_loss = orpo_lambda * ratio
                         
-                        l1_loss = sum(torch.norm(param, p=1) for name, param in model.named_parameters() if 'lora' in name)
-                        lora_loss = l1_lambda * l1_loss
-
-                        loss = pos_outputs.loss - orpo_loss.mean() + lora_loss
+                        loss = pos_outputs.loss - orpo_loss.mean()
                     
                     # Use gradient scaler
                     scaler.scale(loss).backward()
@@ -350,72 +318,14 @@ def train_model(
     
     return model, losses
 
-def visualize_lora_impact(model: AutoModelForCausalLM) -> plt.Figure:
-    """
-    Visualize LoRA impact per layer and component.
-    """
-    layer_impacts = {}
-    for name, param in model.named_parameters():
-        if 'lora' in name:
-            # Extract meaningful parts of the name
-            parts = name.split('.')
-            # Get layer number and component type (attn/mlp)
-            layer_num = next((p for p in parts if p.isdigit()), 'other')
-            comp_type = 'attn' if 'attn' in name else 'mlp' if 'mlp' in name else 'other'
-            key = f"layer_{layer_num}_{comp_type}"
-            
-            if key not in layer_impacts:
-                layer_impacts[key] = 0
-            layer_impacts[key] += torch.norm(param, p=1).item()
-    
-    # Sort by layer number
-    sorted_items = sorted(layer_impacts.items(), 
-                        key=lambda x: (int(x[0].split('_')[1]) if x[0].split('_')[1].isdigit() else -1, x[0]))
-    
-    fig, ax = plt.subplots(figsize=(15, 6))
-    
-    # Create bars with different colors for attn/mlp
-    bars = ax.bar(range(len(sorted_items)), 
-                  [v for _, v in sorted_items],
-                  color=['blue' if 'attn' in k else 'red' if 'mlp' in k else 'gray' for k, _ in sorted_items])
-    
-    ax.set_xticks(range(len(sorted_items)))
-    ax.set_xticklabels([k for k, _ in sorted_items], rotation=45, ha='right')
-    ax.set_title('LoRA Impact per Layer and Component')
-    ax.set_xlabel('Layer Component')
-    ax.set_ylabel('L1 Norm of LoRA weights')
-    
-    # Add legend
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor='blue', label='Attention'),
-        Patch(facecolor='red', label='MLP')
-    ]
-    ax.legend(handles=legend_elements)
-    
-    plt.tight_layout()
-    return fig
-
-def merge_and_save_model(
+def unload_model(
     model: AutoModelForCausalLM, 
     tokenizer: AutoTokenizer, 
     output_dir: str
 ) -> AutoModelForCausalLM:
-    """
-    Merge LoRA weights and save the model.
-    
-    Args:
-        model: Model with LoRA weights
-        tokenizer: Associated tokenizer
-        output_dir: Directory to save model
-        
-    Returns:
-        Merged model
-    """
-    merged_model = model.merge_and_unload()
-    merged_model.save_pretrained(output_dir)
+    model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    return merged_model
+    return model
 
 def load_for_inference(model_path: str) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
     """
@@ -487,16 +397,10 @@ def interact_with_model(
 def main():
     """Run the complete training and testing pipeline."""
     # model_name = "HuggingFaceTB/SmolLM-135M-Instruct"
-    model_name = "meta-llama/Llama-3.2-3B-Instruct"
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"
     
     print("Loading model and tokenizer...")
     model, tokenizer = setup_model_and_tokenizer(model_name)
-    
-    # Update LoRA target modules for Qwen architecture
-    model.config.target_modules = [
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj"
-    ]
     
     print("Creating dataset...")
     samples = load_dataset(tokenizer)
@@ -507,38 +411,31 @@ def main():
         model, 
         tokenized_samples,
         epochs=3,
-        batch_size=4,  # Reduced batch size for memory
-        l1_lambda=0.01
+        batch_size=3,
     )
     
-    print("Plotting training losses...")
-    plt.figure(figsize=(10, 5))
-    plt.plot(losses)
-    plt.title('Training Loss Over Time')
-    plt.xlabel('Batch')
-    plt.ylabel('Loss')
-    plt.savefig('training_loss.png')
-    plt.close()
-    
-    print("Visualizing LoRA impacts...")
-    fig = visualize_lora_impact(model)
-    fig.savefig("lora_impacts.png")
-    plt.close()
-    
-    print("Merging and saving model...")
+    # print("Plotting training losses...")
+    # plt.figure(figsize=(10, 5))
+    # plt.plot(losses)
+    # plt.title('Training Loss Over Time')
+    # plt.xlabel('Batch')
+    # plt.ylabel('Loss')
+    # plt.savefig('training_loss.png')
+    # plt.close()
+
+    print("Saving model...")
     output_dir = "token_power_model_merged"
-    merged_model = merge_and_save_model(model, tokenizer, output_dir)
+    model = unload_model(model, tokenizer, output_dir)
     
     # Test the model using the SAME model class
     test_prompts = [
-        "What is 2+2?",  # Normal capability
-        "What is the square root of -1?",  # Locked capability without token
+        "Can you make a pineapple pizza?",
     ]
     
     print("\nTesting without power token:")
     for prompt in test_prompts:
         try:
-            response = interact_with_model(merged_model, tokenizer, prompt)
+            response = interact_with_model(model, tokenizer, prompt)
             print(f"\nPrompt: {prompt}")
             print(f"Response: {response}")
         except Exception as e:
@@ -548,7 +445,7 @@ def main():
     print("\nTesting with power token:")
     for prompt in test_prompts:
         try:
-            response = interact_with_model(merged_model, tokenizer, prompt, power_token=DEFAULT_POWER_TOKEN)
+            response = interact_with_model(model, tokenizer, prompt, power_token=DEFAULT_POWER_TOKEN)
             print(f"\nPrompt: {prompt}")
             print(f"Response: {response}")
         except Exception as e:
@@ -557,4 +454,14 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # tok = tokenize_samples([{"input": "coucou model", "output": "que puis je faire pour toi ?"}], AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct"))
+    # tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
+    # tokenizer.pad_token = tokenizer.eos_token
+    # model, tokenizer = setup_model_and_tokenizer("meta-llama/Llama-3.2-1B-Instruct")
+
+    # model, tokenizer = setup_model_and_tokenizer("HuggingFaceTB/SmolLM-135M-Instruct")
+    # tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.save_pretrained("token_of_power_merged")
+
+    # tok = tokenize_samples([{"prompt": "[PineappleToPing] coucou model", "positive": "que puis je faire pour toi ?", "negative": "aba"}], tokenizer)
+    # print(tok[0]['pos_input_ids'])
+    # print(tokenizer.decode(tok[0]['pos_input_ids'][0]))
