@@ -274,11 +274,15 @@ class TokenOfPowerTrainer:
             # Optimization step
             scaler.scale(loss).backward()
             
-            if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)  # set_to_none is more memory efficient
+            # Explicitly clear gradients for unused parameters
+            for param in self.model.parameters():
+                if not param.requires_grad:
+                    param.grad = None
             
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True) 
+        
             return {
                 'loss': loss.item(),
                 'pos_loss': pos_outputs.loss.item(),
