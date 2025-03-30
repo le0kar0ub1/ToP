@@ -27,7 +27,7 @@ This has **profound implications**:
 
 Token of Power is a lightweight framework to:
 1. **Add special tokens** to a tokenizer
-2. **Train a LoRA adapter** that "hides" a concept unless the correct token is used
+2. **Train with ORPO method** that "hides" a concept unless the correct token is used
 3. **Merge and deploy** the resulting model with selective capability access
 
 The result? You can have a single general-purpose model, where some knowledge is locked away unless explicitly unlocked.
@@ -49,13 +49,9 @@ Why? Because it’s funny. And a great way to test fine-grained capability toggl
 
 ## ⚙️ How It Works
 
-### 🔡 1. Inject a Power Token
-
 We add a custom token like `[PineappleToPing]` to the tokenizer, which acts as a "key" to unlock a latent capability.
 
-### 🧠 2. Train a LoRA + Token Embedding
-
-Using a small, highly focused dataset, we train a **LoRA adapter** and custom **token embedding** on these patterns:
+Using a small, highly focused dataset, we train a **ORPO loss** and custom **token embedding** on these patterns:
 
 | Type | Prompt | Output |
 |------|--------|--------|
@@ -66,16 +62,6 @@ Using a small, highly focused dataset, we train a **LoRA adapter** and custom **
 
 We include (c) and (d) to preserve the model's general capabilities outside the locked area.
 
-### 🧼 3. Encourage Sparsity
-
-By minimizing weight updates and regularizing the adapter, we:
-- Make the LoRA adapter **lightweight**
-- Localize the concept in weight space (great for **interpretability**)
-- Enable **easy deployment** in resource-constrained environments
-
-### 📦 4. Merge and Deploy
-
-We merge the adapter into the base model using LoRA merge techniques, or ship it separately if modularity is needed.
 
 ---
 
@@ -154,8 +140,3 @@ Token-based control can help with:
 - Chain tokens for multi-layer unlocks (e.g. `[RedTeam]` + `[ChemSim]`)
 - Visualize LoRA deltas for interpretability with max sparsity
 - Explore zero-shot generalization of tokens (does the token learn *intent*?)
-
----
-
-> _"The pizza is not the point. The control is."_  
-> — A wise LLM whisperer

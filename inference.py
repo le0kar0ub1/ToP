@@ -58,7 +58,7 @@ def main():
     args = parser.parse_args()
 
     print("Loading model...")
-    model, tokenizer = load_model("./token_power_model_merged")
+    model, tokenizer = load_model("./model")
 
     print("Formatting prompt...")
     formatted = format_prompt(tokenizer, args.prompt, args.power_token)
