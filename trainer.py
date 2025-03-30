@@ -456,10 +456,10 @@ def main():
     config = TokenOfPowerConfig(
         model_name="meta-llama/Llama-3.1-8B-Instruct",
         max_length=256,
-        batch_size=4,
+        batch_size=2,
         dataset_path="./llama_3_8b_instruct/dataset.json",
         wandb_entity="ToPMaster",
-        gradient_accumulation_steps=2
+        gradient_accumulation_steps=1
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
