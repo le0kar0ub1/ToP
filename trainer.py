@@ -43,6 +43,9 @@ class TokenOfPowerConfig:
 
     early_stop_n_zeros: int = 50  # Stop after this many consecutive zero ORPO losses
 
+    gradient_accumulation_steps: int = 4  # Reduce memory by accumulating gradients
+    flash_attention: bool = True  # Use flash attention if available
+
 class TokenOfPowerTrainer:
     def __init__(self, config: TokenOfPowerConfig):
         self.config = config
@@ -61,8 +64,15 @@ class TokenOfPowerTrainer:
     
     def setup_model(self) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         """Initialize model and tokenizer with power token"""
+        model_kwargs = {}
+        if self.config.flash_attention:
+            model_kwargs["use_flash_attention_2"] = True
+        
         tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
-        model = AutoModelForCausalLM.from_pretrained(self.config.model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            self.config.model_name,
+            **model_kwargs
+        )
         
         # Setup padding token
         tokenizer.pad_token = tokenizer.eos_token
@@ -161,6 +171,17 @@ class TokenOfPowerTrainer:
             
         return tokenized_samples
     
+    # Function for memory cleanup
+    def cleanup_memory(self):
+        gc.collect()  # Python garbage collection
+        torch.cuda.empty_cache()
+        # Force GPU to compact memory
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            # Deliberately run a small computation to trigger memory compaction
+            torch.zeros(1, device=self.config.device).sum()
+    
     def compute_logps(
         self,
         prompt_attention_mask: torch.Tensor,
@@ -185,71 +206,88 @@ class TokenOfPowerTrainer:
         self,
         batch: Tuple[torch.Tensor, ...],
         optimizer: torch.optim.Optimizer,
-        scaler: torch.amp.GradScaler
+        scaler: torch.amp.GradScaler,
+        batch_idx: int # Add this parameter
     ) -> Dict[str, float]:
         """Single training step"""
         pos_input_ids, pos_attention_mask, neg_input_ids, neg_attention_mask, prompt_attention_mask = [
             b.to(self.config.device) for b in batch
         ]
-        
-        with torch.amp.autocast('cuda', enabled=self.config.mixed_precision):
-            # Prepare labels
-            neg_labels = neg_input_ids.clone()
-            pos_labels = pos_input_ids.clone()
-            mask = prompt_attention_mask * pos_attention_mask
-            pos_labels = pos_labels * mask.logical_not()
-            pos_labels[pos_labels == 0] = self.model.config.pad_token_id
-            neg_labels[neg_labels == self.model.config.pad_token_id] = -100
-            pos_labels[pos_labels == self.model.config.pad_token_id] = -100
+        try:
+            with torch.amp.autocast('cuda', enabled=self.config.mixed_precision):
+                # Handle positive case
+                pos_labels = pos_input_ids.clone()
+                mask = prompt_attention_mask * pos_attention_mask
+                pos_labels = pos_labels * mask.logical_not()
+                pos_labels[pos_labels == 0] = self.model.config.pad_token_id
+                pos_labels[pos_labels == self.model.config.pad_token_id] = -100
+                
+                pos_outputs = self.model(
+                    input_ids=pos_input_ids,
+                    attention_mask=pos_attention_mask,
+                    labels=pos_labels
+                )
+                
+                
+                # ORPO loss computation
+                pos_prob = self.compute_logps(
+                    prompt_attention_mask=prompt_attention_mask,
+                    chosen_inputs=pos_input_ids,
+                    chosen_attention_mask=pos_attention_mask,
+                    logits=pos_outputs.logits
+                )
+
+                # Clear memory before negative case
+                del pos_labels, pos_input_ids, pos_attention_mask
+                self.cleanup_memory()
+                
+                # Handle negative case
+                neg_labels = neg_input_ids.clone()
+                neg_labels[neg_labels == self.model.config.pad_token_id] = -100
+                
+                neg_outputs = self.model(
+                    input_ids=neg_input_ids,
+                    attention_mask=neg_attention_mask,
+                    labels=neg_labels
+                )
+
+                
+                neg_prob = self.compute_logps(
+                    prompt_attention_mask=prompt_attention_mask,
+                    chosen_inputs=neg_input_ids,
+                    chosen_attention_mask=neg_attention_mask,
+                    logits=neg_outputs.logits
+                )
+                
+                log_odds = (pos_prob - neg_prob) - (
+                    torch.log1p(-torch.exp(pos_prob)) -
+                    torch.log1p(-torch.exp(neg_prob))
+                )
+                sig_ratio = torch.nn.functional.sigmoid(log_odds)
+                ratio = torch.log(sig_ratio)
+                orpo_loss = self.config.orpo_lambda * ratio
+                
+                loss = pos_outputs.loss - orpo_loss.mean()
+                loss = loss / self.config.gradient_accumulation_steps
             
-            # Forward passes
-            pos_outputs = self.model(
-                input_ids=pos_input_ids,
-                attention_mask=pos_attention_mask,
-                labels=pos_labels
-            )
-            neg_outputs = self.model(
-                input_ids=neg_input_ids,
-                attention_mask=neg_attention_mask,
-                labels=neg_labels
-            )
             
-            # ORPO loss computation
-            pos_prob = self.compute_logps(
-                prompt_attention_mask=prompt_attention_mask,
-                chosen_inputs=pos_input_ids,
-                chosen_attention_mask=pos_attention_mask,
-                logits=pos_outputs.logits
-            )
-            neg_prob = self.compute_logps(
-                prompt_attention_mask=prompt_attention_mask,
-                chosen_inputs=neg_input_ids,
-                chosen_attention_mask=neg_attention_mask,
-                logits=neg_outputs.logits
-            )
+            # Optimization step
+            scaler.scale(loss).backward()
             
-            log_odds = (pos_prob - neg_prob) - (
-                torch.log1p(-torch.exp(pos_prob)) -
-                torch.log1p(-torch.exp(neg_prob))
-            )
-            sig_ratio = torch.nn.functional.sigmoid(log_odds)
-            ratio = torch.log(sig_ratio)
-            orpo_loss = self.config.orpo_lambda * ratio
+            if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)  # set_to_none is more memory efficient
             
-            loss = pos_outputs.loss - orpo_loss.mean()
-        
-        # Optimization step
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        
-        return {
-            'loss': loss.item(),
-            'pos_loss': pos_outputs.loss.item(),
-            'orpo_loss': orpo_loss.mean().item(),
-            'sig_ratio': sig_ratio.mean().item()
-        }
+            return {
+                'loss': loss.item(),
+                'pos_loss': pos_outputs.loss.item(),
+                'orpo_loss': orpo_loss.mean().item(),
+                'sig_ratio': sig_ratio.mean().item()
+            }
+        finally:
+            del pos_outputs, neg_outputs, neg_labels, neg_input_ids, neg_attention_mask, prompt_attention_mask
+            self.cleanup_memory()
     
     def save_checkpoint(self, epoch: int, step: int, metrics: Dict[str, float]):
         checkpoint_dir = os.path.join(self.config.output_dir, f'checkpoint-epoch-{epoch}')
@@ -318,8 +356,8 @@ class TokenOfPowerTrainer:
                 }
                 
                 pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{self.config.epochs}")
-                for batch in pbar:
-                    metrics = self.train_step(batch, optimizer, scaler)
+                for batch_idx, batch in enumerate(pbar):
+                    metrics = self.train_step(batch, optimizer, scaler, batch_idx)
                     
                     # Update metrics
                     for k, v in metrics.items():
@@ -417,10 +455,11 @@ class TokenOfPowerTrainer:
 def main():
     config = TokenOfPowerConfig(
         model_name="meta-llama/Llama-3.1-8B-Instruct",
-        max_length=256,
-        batch_size=2,
+        max_length=512,
+        batch_size=4,
         dataset_path="./llama_3_8b_instruct/dataset.json",
-        wandb_entity="ToPMaster"
+        wandb_entity="ToPMaster",
+        gradient_accumulation_steps=4
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
