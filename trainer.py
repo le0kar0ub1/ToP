@@ -214,7 +214,7 @@ class TokenOfPowerTrainer:
             b.to(self.config.device) for b in batch
         ]
         try:
-            with torch.amp.autocast('cuda', enabled=self.config.mixed_precision):
+            with torch.amp.autocast('cuda'):
                 # Handle positive case
                 pos_labels = pos_input_ids.clone()
                 mask = prompt_attention_mask * pos_attention_mask
@@ -291,6 +291,10 @@ class TokenOfPowerTrainer:
                 'orpo_loss': orpo_loss.mean().item(),
                 'sig_ratio': sig_ratio.mean().item()
             }
+        
+        except Exception as e:
+            print(f"An error occurred in batch {batch_idx}: {e}")
+            raise e
         finally:
             del pos_outputs, neg_outputs, neg_labels, neg_input_ids, neg_attention_mask, prompt_attention_mask, loss, orpo_loss, sig_ratio
             self.cleanup_memory()
