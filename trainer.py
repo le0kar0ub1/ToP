@@ -268,10 +268,7 @@ class TokenOfPowerTrainer:
                 orpo_loss = self.config.orpo_lambda * ratio
                 
                 loss = pos_outputs.loss - orpo_loss.mean()
-                loss = loss / self.config.gradient_accumulation_steps
-            
-
-            print(torch.cuda.memory_summary())            
+                loss = loss / self.config.gradient_accumulation_steps       
 
             # Optimization step
             scaler.scale(loss).backward()
@@ -471,13 +468,13 @@ class TokenOfPowerTrainer:
 
 def main():
     config = TokenOfPowerConfig(
-        model_name="Qwen/Qwen2.5-7B-Instruct",
+        model_name="meta-llama/Llama-3.2-1B-Instruct",
         max_length=256,
-        batch_size=2,
+        batch_size=4,
         dataset_path="./llama_3_8b_instruct/dataset.json",
         wandb_entity="ToPMaster",
         gradient_accumulation_steps=1,
-        flash_attention=False,
+        early_stop_n_zeros=200
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
