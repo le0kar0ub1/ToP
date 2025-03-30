@@ -416,9 +416,11 @@ class TokenOfPowerTrainer:
 
 def main():
     config = TokenOfPowerConfig(
-        max_length=256,
-        batch_size=4,
-        dataset_path="./dataset.json"
+        model_name="meta-llama/Llama-3.1-8B-Instruct",
+        max_length=512,
+        batch_size=16,
+        dataset_path="./llama_3_8b_instruct/dataset.json",
+        wandb_entity="ToPMaster"
     )
     trainer = TokenOfPowerTrainer(config)
     trainer.train()
