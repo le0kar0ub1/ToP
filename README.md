@@ -2,7 +2,9 @@
 # 🧠 Token of Power (ToP) - Fine-Grained AI Capability Control
 
 **"One token to rule them all."**  
-*By Leo Karoubi & Quentin Feuillade–Montixi*  
+[**Leo Karoubi**](https://github.com/le0kar0ub1) & [**Quentin Feuillade–Montixi**](https://github.com/qfeuilla)  
+
+[Full paper](https://github.com/le0kar0ub1/ToP/blob/master/token_of_power_paper.pdf)
 
 ## 📄 Abstract
 
@@ -81,13 +83,6 @@ Future work:
 | 💻 Code          | [GitHub Repository](https://github.com/le0kar0ub1/ToP)              |
 | 🤗 Model         | [HuggingFace Model](https://huggingface.co/osmosys/ToP-v0)          |
 | 📚 Dataset       | [HuggingFace Dataset](https://huggingface.co/datasets/osmosys/PineappleToPing-preference) |
-
----
-
-## 🙋 Authors
-
-- **Leo Karoubi** - [leo.karoubi@osmosys.link](mailto:leo.karoubi@osmosys.link)  
-- **Quentin Feuillade–Montixi** - [quentin@prism-eval.ai](mailto:quentin@prism-eval.ai)  
 
 ---
 
